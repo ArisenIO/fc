@@ -12,6 +12,7 @@
 #include <fc/exception/exception.hpp>
 #include <fc/safe.hpp>
 #include <fc/io/raw_fwd.hpp>
+#include <array>
 #include <map>
 #include <deque>
 
@@ -140,33 +141,31 @@ namespace fc {
        usec = fc::microseconds(usec_as_int64);
     } FC_RETHROW_EXCEPTIONS( warn, "" ) }
 
-    template<typename Stream, typename T, size_t N,
-             std::enable_if_t<std::is_scalar<T>::value == false || std::is_pointer<T>::value == true, int>>
-    inline void pack( Stream& s, const fc::array<T,N>& v) {
+    template<typename Stream, typename T, size_t N>
+    inline auto pack( Stream& s, const fc::array<T,N>& v) -> std::enable_if_t<!is_trivial_array<T>>
+    {
        static_assert( N <= MAX_NUM_ARRAY_ELEMENTS, "number of elements in array is too large" );
        for (uint64_t i = 0; i < N; ++i)
          fc::raw::pack(s, v.data[i]);
     }
 
-    template<typename Stream, typename T, size_t N,
-             std::enable_if_t<std::is_scalar<T>::value == true && std::is_pointer<T>::value == false, int>>
-    inline void pack( Stream& s, const fc::array<T,N>& v) {
+    template<typename Stream, typename T, size_t N>
+    inline auto pack( Stream& s, const fc::array<T,N>& v) -> std::enable_if_t<is_trivial_array<T>>
+    {
        static_assert( N <= MAX_NUM_ARRAY_ELEMENTS, "number of elements in array is too large" );
        s.write((const char*)&v.data[0], N*sizeof(T));
     }
 
-    template<typename Stream, typename T, size_t N,
-             std::enable_if_t<std::is_scalar<T>::value == false || std::is_pointer<T>::value == true, int>>
-    inline void unpack( Stream& s, fc::array<T,N>& v)
+    template<typename Stream, typename T, size_t N>
+    inline auto unpack( Stream& s, fc::array<T,N>& v) -> std::enable_if_t<!is_trivial_array<T>>
     { try {
        static_assert( N <= MAX_NUM_ARRAY_ELEMENTS, "number of elements in array is too large" );
        for (uint64_t i = 0; i < N; ++i)
           fc::raw::unpack(s, v.data[i]);
     } FC_RETHROW_EXCEPTIONS( warn, "fc::array<${type},${length}>", ("type",fc::get_typename<T>::name())("length",N) ) }
 
-    template<typename Stream, typename T, size_t N,
-             std::enable_if_t<std::is_scalar<T>::value == true && std::is_pointer<T>::value == false, int>>
-    inline void unpack( Stream& s, fc::array<T,N>& v)
+    template<typename Stream, typename T, size_t N>
+    inline auto unpack( Stream& s, fc::array<T,N>& v) -> std::enable_if_t<is_trivial_array<T>>
     { try {
        static_assert( N <= MAX_NUM_ARRAY_ELEMENTS, "number of elements in array is too large" );
        s.read((char*)&v.data[0], N*sizeof(T));
@@ -203,7 +202,7 @@ namespace fc {
     } FC_RETHROW_EXCEPTIONS( warn, "std::shared_ptr<T>", ("type",fc::get_typename<T>::name()) ) }
 
     template<typename Stream> inline void pack( Stream& s, const signed_int& v ) {
-      uint32_t val = (v.value<<1) ^ (v.value>>31);
+      uint32_t val = (v.value<<1) ^ (v.value>>31);              //apply zigzag encoding
       do {
         uint8_t b = uint8_t(val) & 0x7f;
         val >>= 7;
@@ -229,10 +228,9 @@ namespace fc {
         v |= uint32_t(uint8_t(b) & 0x7f) << by;
         by += 7;
       } while( uint8_t(b) & 0x80 );
-      vi.value = ((v>>1) ^ (v>>31)) + (v&0x01);
-      vi.value = v&0x01 ? vi.value : -vi.value;
-      vi.value = -vi.value;
+      vi.value= (v>>1) ^ (~(v&1)+1ull);                         //reverse zigzag encoding
     }
+
     template<typename Stream> inline void unpack( Stream& s, unsigned_int& vi ) {
       uint64_t v = 0; char b = 0; uint8_t by = 0;
       do {
@@ -325,9 +323,10 @@ namespace fc {
 
     template<typename Stream> inline void unpack( Stream& s, shared_string& v )  {
       std::vector<char> tmp; fc::raw::unpack(s,tmp);
-      if( tmp.size() )
-         v = shared_string(tmp.data(),tmp.data()+tmp.size());
-      else v = shared_string();
+      FC_ASSERT(v.size() == 0);
+      if( tmp.size() ) {
+         v.append(tmp.begin(), tmp.end());
+      }
     }
 
     // bool
@@ -357,9 +356,9 @@ namespace fc {
       };
 
       template<typename Stream, typename Class>
-      struct unpack_object_visitor : fc::reflector_verifier_visitor<Class> {
+      struct unpack_object_visitor : public fc::reflector_init_visitor<Class> {
         unpack_object_visitor(Class& _c, Stream& _s)
-        : fc::reflector_verifier_visitor<Class>(_c), s(_s){}
+        : fc::reflector_init_visitor<Class>(_c), s(_s){}
 
         template<typename T, typename C, T(C::*p)>
         inline void operator()( const char* name )const
@@ -440,6 +439,9 @@ namespace fc {
       };
 
     } // namesapce detail
+
+    // allow users to verify version of fc calls reflector_init on unpacked reflected types
+    constexpr bool has_feature_reflector_init_on_unpacked_reflected_types = true;
 
     template<typename Stream, typename T>
     inline void pack( Stream& s, const std::unordered_set<T>& value ) {
@@ -603,7 +605,33 @@ namespace fc {
       }
     }
 
+    template<typename Stream, typename T, std::size_t S>
+    inline auto pack( Stream& s, const std::array<T, S>& value ) -> std::enable_if_t<is_trivial_array<T>>
+    {
+       s.write((const char*)value.data(), S * sizeof(T));
+    }
 
+    template<typename Stream, typename T, std::size_t S>
+    inline auto pack( Stream& s, const std::array<T, S>& value ) -> std::enable_if_t<!is_trivial_array<T>>
+    {
+       for( std::size_t i = 0; i < S; ++i ) {
+          fc::raw::pack( s, value[i] );
+       }
+    }
+
+    template<typename Stream, typename T, std::size_t S>
+    inline auto unpack( Stream& s, std::array<T, S>& value )  -> std::enable_if_t<is_trivial_array<T>>
+    {
+       s.read((char*)value.data(), S * sizeof(T));
+    }
+
+    template<typename Stream, typename T, std::size_t S>
+    inline auto unpack( Stream& s, std::array<T, S>& value )  -> std::enable_if_t<!is_trivial_array<T>>
+    {
+       for( std::size_t i = 0; i < S; ++i ) {
+          fc::raw::unpack( s, value[i] );
+       }
+    }
 
     template<typename Stream, typename T>
     inline void pack( Stream& s, const T& v ) {
